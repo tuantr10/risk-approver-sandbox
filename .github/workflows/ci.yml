@@ -12,4 +12,4 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - run: sleep 40 && echo ok
+      - run: sleep 20 && exit 1

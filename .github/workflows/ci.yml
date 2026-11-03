@@ -1,0 +1,15 @@
+# Sandbox stand-in for the real CI: one check that takes a little while, so the
+# approver has to wait for it.
+name: ci
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: sleep 40 && echo ok

@@ -1,0 +1,184 @@
+# Low-risk auto-approver (sandbox build).
+# Approves a PR as the GitHub App only when its risk tier is Low and every other
+# check on the head commit is green. Withdraws the app's approval when the tier is
+# not Low, when checks are red, or when the approval is for an older commit.
+# No checkout and no PR code is run: changed files, reviews and checks come from the API.
+#
+# Sandbox only: the workflow can't be on main yet, so it triggers on pull_request and
+# runs the PR branch's copy. The org build must use pull_request_target + workflow_run
+# from the default branch instead (see the notes at the bottom).
+name: low-risk-approver
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+  # Fires only when this file is on the default branch. Re-checks a PR when CI finishes.
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+
+# GITHUB_TOKEN is read-only. All writes (reviews, dismissals) use the app token.
+permissions:
+  contents: read
+  pull-requests: read
+  checks: read
+  statuses: read
+
+concurrency:
+  group: low-risk-approver-${{ github.event.pull_request.number || github.event.workflow_run.head_sha }}
+  cancel-in-progress: true
+
+jobs:
+  low-risk-approver:
+    # Same-repo PRs only. Fork PRs get no secrets and are never auto-approved.
+    if: >-
+      (github.event_name != 'pull_request' && github.event_name != 'pull_request_target') ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - id: app
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+      - uses: actions/github-script@v9
+        env:
+          APP_TOKEN: ${{ steps.app.outputs.token }}
+          APP_SLUG: ${{ steps.app.outputs.app-slug }}
+          SELF_CHECK: low-risk-approver # this job's check-run name, ignored when reading checks
+          REQUIRED_CHECKS: test # checks that must exist and pass, comma-separated
+          USE_BUGBOT_NOTE: "false" # org build: "true" (tier = max(Bugbot note, paths))
+          BUGBOT_EDITOR: cursor
+          WAIT_MINUTES: "20"
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const env = process.env;
+            const app = getOctokit(env.APP_TOKEN);
+            const APP_LOGIN = `${env.APP_SLUG}[bot]`;
+            const ORDER = { low: 0, medium: 1, high: 2 };
+            const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+            // Which PR: from the PR event, or from the workflow_run that just finished.
+            let number = context.payload.pull_request && context.payload.pull_request.number;
+            if (!number && context.payload.workflow_run) {
+              const wr = context.payload.workflow_run;
+              number = wr.pull_requests && wr.pull_requests[0] && wr.pull_requests[0].number;
+              if (!number) {
+                const { data: prs } = await github.rest.repos.listPullRequestsAssociatedWithCommit({ owner, repo, commit_sha: wr.head_sha });
+                const open = prs.find((p) => p.state === "open" && p.head.sha === wr.head_sha);
+                number = open && open.number;
+              }
+            }
+            if (!number) { core.info("No open PR for this event."); return; }
+            const getPr = async () => (await github.rest.pulls.get({ owner, repo, pull_number: number })).data;
+            let pr = await getPr();
+            const head = pr.head.sha;
+            if (pr.state !== "open") { core.info("PR is not open."); return; }
+            if (pr.head.repo.full_name !== `${owner}/${repo}`) { core.info("Fork PR, never auto-approved."); return; }
+
+            // BEGIN classifier (same evaluation as risk-tier.yml; sandbox trims the lists)
+            const HIGH = [
+              /^db\/(migrate|views)\//, /^db\/schema\.rb$/,
+              /^config\/initializers\/(devise|doorkeeper|omniauth|session_store|cors|content_security_policy)\.rb$/,
+              /^app\/services\/(billing|invoices|auth|saml|scim|oauth)\//,
+              /^app\/controllers\/(sessions|password_resets|omniauth_callbacks|application)_controller\.rb$/,
+              /^\.github\//, /^\.cursor\/BUGBOT\.md$/, /(^|\/)CODEOWNERS$/, /^AGENTS\.md$/,
+              /^(Gemfile|Gemfile\.lock|package\.json|package-lock\.json)$/,
+              /^e2e\/package(-lock)?\.json$/,
+            ];
+            const LOW = [/^docs\//, /\.md$/, /^config\/locales\//, /^spec\//, /^e2e\//, /^\.rubocop\.yml$/];
+            // Sandbox only: every test PR carries these two files because they can't be on main yet.
+            const IGNORE = [/^\.github\/workflows\/(low-risk-approver|ci)\.yml$/];
+            const fileTier = (f) => HIGH.some((re) => re.test(f)) ? "high" : LOW.some((re) => re.test(f)) ? "low" : "medium";
+            const pathTier = (files) => {
+              const kept = files.filter((f) => !IGNORE.some((re) => re.test(f)));
+              if (!kept.length) return "medium";
+              return kept.map(fileTier).reduce((a, b) => (ORDER[b] > ORDER[a] ? b : a), "low");
+            };
+            // END classifier
+
+            const files = await github.paginate(github.rest.pulls.listFiles, { owner, repo, pull_number: number, per_page: 100 });
+            const names = files.flatMap((f) => [f.filename, f.previous_filename].filter(Boolean));
+            let tier = files.length < pr.changed_files ? "medium" : pathTier(names); // file list cut off: never Low
+            let pending = false;
+
+            // Org build: Bugbot's note from its own latest body edit, highest wins (risk-tier.yml logic).
+            if (env.USE_BUGBOT_NOTE === "true") {
+              const parse = (body) => {
+                const block = (body || "").match(/<!-- CURSOR_SUMMARY -->([\s\S]*?)<!-- \/CURSOR_SUMMARY -->/);
+                if (!block) return null;
+                const t = block[1].match(/\*\*(Low|Medium|High) Risk\*\*/i);
+                const sha = block[1].match(/for commit ([0-9a-f]{7,40})/);
+                return t ? { tier: t[1].toLowerCase(), sha: sha && sha[1] } : null;
+              };
+              const q = `query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pullRequest(number:$n){
+                userContentEdits(first:50){nodes{editor{login} diff}}}}}`;
+              const edits = (await github.graphql(q, { o: owner, r: repo, n: number })).repository.pullRequest.userContentEdits.nodes;
+              const botEdit = edits.find((e) => e.editor && e.editor.login === env.BUGBOT_EDITOR);
+              const note = botEdit ? parse(botEdit.diff) : null;
+              if (note && ORDER[note.tier] > ORDER[tier]) tier = note.tier;
+              pending = !note || !note.sha || !head.startsWith(note.sha);
+            }
+
+            // The app's own reviews. Its latest APPROVED reviews are the ones that count.
+            const reviews = await github.paginate(github.rest.pulls.listReviews, { owner, repo, pull_number: number, per_page: 100 });
+            const mine = reviews.filter((r) => r.user && r.user.login === APP_LOGIN);
+            const withdraw = async (keepHead, reason) => {
+              for (const r of mine.filter((r) => r.state === "APPROVED" && !(keepHead && r.commit_id === head))) {
+                try {
+                  await app.rest.pulls.dismissReview({ owner, repo, pull_number: number, review_id: r.id, message: reason, event: "DISMISS" });
+                  core.info(`Dismissed approval ${r.id} (${r.commit_id.slice(0, 7)}): ${reason}`);
+                } catch (e) {
+                  core.warning(`Dismiss failed (${e.status}), requesting changes instead: ${e.message}`);
+                  await app.rest.pulls.createReview({ owner, repo, pull_number: number, commit_id: head, event: "REQUEST_CHANGES", body: reason });
+                }
+              }
+            };
+
+            const summary = (msg) => { core.info(msg); return core.summary.addRaw(`${msg}\n`).write(); };
+            if (tier !== "low" || pending) {
+              await withdraw(false, `Risk tier is ${pending ? "pending" : tier} for ${head.slice(0, 7)}; auto-approval withdrawn.`);
+              return summary(`tier=${tier} pending=${pending} head=${head.slice(0, 7)}: not approving`);
+            }
+            // An approval for an older commit doesn't cover this one.
+            await withdraw(true, `New commit ${head.slice(0, 7)}; auto-approval withdrawn until it is checked.`);
+            if (mine.some((r) => r.state === "APPROVED" && r.commit_id === head)) {
+              return summary(`tier=low head=${head.slice(0, 7)}: already approved`);
+            }
+
+            // Wait for every other check and status on the head commit.
+            const required = (env.REQUIRED_CHECKS || "").split(",").map((s) => s.trim()).filter(Boolean);
+            const deadline = Date.now() + Number(env.WAIT_MINUTES || 20) * 60e3;
+            let verdict;
+            for (;;) {
+              const runs = await github.paginate(github.rest.checks.listForRef, { owner, repo, ref: head, per_page: 100 });
+              const latest = new Map();
+              for (const r of runs) {
+                if (r.name === env.SELF_CHECK) continue;
+                const prev = latest.get(r.name);
+                if (!prev || new Date(r.started_at || 0) > new Date(prev.started_at || 0)) latest.set(r.name, r);
+              }
+              const { data: combined } = await github.rest.repos.getCombinedStatusForRef({ owner, repo, ref: head });
+              const all = [
+                ...[...latest.values()].map((r) => ({ name: r.name, state: r.status !== "completed" ? "pending" : ["success", "neutral", "skipped"].includes(r.conclusion) ? "success" : "failure" })),
+                ...combined.statuses.map((s) => ({ name: s.context, state: s.state === "success" ? "success" : s.state === "pending" ? "pending" : "failure" })),
+              ];
+              const missing = required.filter((n) => !all.some((c) => c.name === n));
+              const red = all.filter((c) => c.state === "failure");
+              const waiting = all.filter((c) => c.state === "pending");
+              if (red.length) { verdict = `red: ${red.map((c) => c.name).join(", ")}`; break; }
+              if (!missing.length && !waiting.length) { verdict = "green"; break; }
+              if (Date.now() > deadline) { verdict = `timed out waiting for ${[...missing, ...waiting.map((c) => c.name)].join(", ")}`; break; }
+              await sleep(15000);
+            }
+            pr = await getPr();
+            if (pr.head.sha !== head) return summary(`head moved to ${pr.head.sha.slice(0, 7)}; the newer run decides`);
+            if (verdict !== "green") return summary(`tier=low head=${head.slice(0, 7)}: not approving, checks ${verdict}`);
+
+            await app.rest.pulls.createReview({
+              owner, repo, pull_number: number, commit_id: head, event: "APPROVE",
+              body: `Auto-approved: risk tier Low and all checks green on ${head.slice(0, 7)}.`,
+            });
+            return summary(`tier=low head=${head.slice(0, 7)}: approved as ${APP_LOGIN}`);
